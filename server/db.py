@@ -140,6 +140,33 @@ CREATE TABLE IF NOT EXISTS erratum_item (
     paper_b_old_letter       TEXT,
     paper_b_new_letter       TEXT
 );
+
+-- Released score batches: an immutable snapshot of every sheet registered at
+-- publish time, graded against the answer key as of that same moment.  The
+-- batch rows copy paper/examinee/total and per-question scores, so later
+-- registrations, errata or bank edits never rewrite a published batch.
+CREATE TABLE IF NOT EXISTS release_batch (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id    INTEGER NOT NULL REFERENCES seal(id) ON DELETE CASCADE,
+    batch_no   INTEGER NOT NULL,            -- per-seal sequence: 1, 2, 3...
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(seal_id, batch_no)
+);
+CREATE TABLE IF NOT EXISTS release_sheet (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL REFERENCES release_batch(id) ON DELETE CASCADE,
+    paper       TEXT NOT NULL CHECK(paper IN ('A', 'B')),
+    examinee    TEXT NOT NULL,
+    total_score INTEGER NOT NULL,
+    UNIQUE(batch_id, examinee)
+);
+CREATE TABLE IF NOT EXISTS release_item (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_sheet_id INTEGER NOT NULL REFERENCES release_sheet(id) ON DELETE CASCADE,
+    number           INTEGER NOT NULL,      -- printed question number
+    score            INTEGER NOT NULL CHECK(score IN (0, 1)),
+    UNIQUE(release_sheet_id, number)
+);
 """
 
 

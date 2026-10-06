@@ -61,7 +61,7 @@ function renderHome() {
   setActiveNav("home");
   view.replaceChildren(
     h("h1", null, "本地双卷印发校核"),
-    h("p", { class: "muted" }, "单选题库 → 分别编排 A、B 卷 → 同一题库修订封存 → 打印试卷 / 答题卡 / 答案表 → 勘误并同步两卷答案 → 登记答题卡并按勘误复核成绩。"),
+    h("p", { class: "muted" }, "单选题库 → 分别编排 A、B 卷 → 同一题库修订封存 → 打印试卷 / 答题卡 / 答案表 → 勘误并同步两卷答案 → 登记答题卡并按勘误复核成绩 → 按批次发布成绩并逐批对照回看。"),
     h("div", { class: "grid2" },
       h("div", { class: "card" },
         h("h3", null, "① 维护题库"),
@@ -86,6 +86,11 @@ function renderHome() {
       h("div", { class: "card" },
         h("h3", null, "⑤ 登记答题卡与复核"),
         h("p", { class: "small muted" }, "按封存卷印出的题号登记考生作答（每题 1 分、空白 0 分）；勘误后按原作答的封存选项重新核分，对照登记成绩与当前成绩。"),
+        h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
+      ),
+      h("div", { class: "card" },
+        h("h3", null, "⑥ 发布成绩批次"),
+        h("p", { class: "small muted" }, "把当前已登记答题卡按当前答案表核分，发布为不可变批次；再次发布时与上一批逐人对照，标出新登记者与逐题得分变化。"),
         h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
       )
     )
@@ -376,6 +381,7 @@ async function renderSeals() {
 
 const sealState = { detail: null, errata: [], tab: "paperA" };
 const sheetState = { list: [], detail: null, paper: "A" };
+const releaseState = { list: [], detail: null, sheet: null };
 
 function sheetHeader(subtitle) {
   const s = sealState.detail;
@@ -722,11 +728,152 @@ function sheetDetailPanel() {
   return card;
 }
 
+/* ------------------------------------------------------- score releases */
+
+function releasePublishPanel() {
+  const s = sealState.detail;
+  const result = h("div");
+  return h("div", { class: "card screen-only" },
+    h("h3", null, "发布成绩批次"),
+    h("p", { class: "small muted" },
+      "把本封存版本当前已登记的全部答题卡，按当前答案表（含已生效勘误）核分并保存为一个不可变批次：" +
+      "名单按卷别、考生编号排序记录总分，并保存每张卡按印出题号排列的逐题得分。" +
+      "名单与得分取自同一数据库状态——与发布交错的登记或勘误要么整体进入本批，要么整体留到下一批。" +
+      "已发布批次不随之后的登记、勘误或题库修改改变；没有已登记答题卡时拒绝发布。"),
+    h("div", { class: "toolbar" },
+      h("button", {
+        onclick: async () => {
+          result.replaceChildren();
+          try {
+            const r = await api("POST", `/api/seals/${s.id}/releases`);
+            toast(`已发布第 ${r.batch_no} 批，共 ${r.sheet_count} 张答题卡`, "ok");
+            await refreshReleases(r.batch_id);
+          } catch (e) {
+            result.replaceChildren(h("p", { class: "pill err" }, "已拒绝发布：" + e.message));
+          }
+        }
+      }, "发布当前成绩批次")),
+    result);
+}
+
+async function refreshReleases(openBatchId) {
+  const sid = sealState.detail.id;
+  releaseState.list = (await api("GET", `/api/seals/${sid}/releases`)).batches;
+  if (openBatchId) {
+    releaseState.detail = await api("GET", `/api/seals/${sid}/releases/${openBatchId}`);
+    releaseState.sheet = null;
+  }
+  renderSealDetailBody();
+}
+
+function releaseListPanel() {
+  const card = h("div", { class: "card screen-only" }, h("h3", null, "已发布批次"));
+  if (!releaseState.list.length) {
+    card.appendChild(h("p", { class: "muted small" }, "尚未发布过成绩批次。"));
+    return card;
+  }
+  const rows = releaseState.list.map(b => h("tr",
+    releaseState.detail && releaseState.detail.batch.id === b.id ? { class: "changed" } : null,
+    h("td", null, "第 " + b.batch_no + " 批"),
+    h("td", null, b.created_at),
+    h("td", null, b.sheet_count + " 张"),
+    h("td", null, h("button", {
+      class: "mini ghost",
+      onclick: async () => {
+        try {
+          releaseState.detail = await api(
+            "GET", `/api/seals/${sealState.detail.id}/releases/${b.id}`);
+          releaseState.sheet = null;
+          renderSealDetailBody();
+        } catch (e) { toast(e.message, "err"); }
+      }
+    }, "查看名单与对照"))));
+  card.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null,
+      h("th", null, "批次"), h("th", null, "发布时间"),
+      h("th", null, "答题卡数"), h("th", null, "操作"))),
+    h("tbody", null, ...rows)));
+  return card;
+}
+
+function releaseDiffBox(diff) {
+  const box = h("div", { class: "note-box" },
+    h("b", null, `与第 ${diff.previous_batch_no} 批逐人对照`));
+  box.appendChild(h("div", null,
+    diff.new_examinees.length
+      ? "新登记者：" + diff.new_examinees.map(e => `${e.examinee}（${e.paper} 卷）`).join("、")
+      : "无新登记者。"));
+  if (diff.changes.length) {
+    box.appendChild(h("div", null, "得分变化考生的总分对照：" +
+      diff.totals.map(t => `${t.examinee}（${t.paper} 卷）${t.before} → ${t.after}`).join("；") +
+      "。逐题变化如下（总分相抵的也一并列出）："));
+    const trs = diff.changes.map(c => h("tr", null,
+      h("td", null, c.examinee),
+      h("td", null, c.paper + " 卷"),
+      h("td", null, "第 " + c.number + " 题"),
+      h("td", null, (c.before == null ? "—" : c.before) + " → " + c.after)));
+    box.appendChild(h("table", { class: "data", style: "margin-top:6px" },
+      h("thead", null, h("tr", null,
+        h("th", null, "考生编号"), h("th", null, "卷别"),
+        h("th", null, "题号"), h("th", null, "得分 前 → 后"))),
+      h("tbody", null, ...trs)));
+  } else {
+    box.appendChild(h("div", null, "在册考生逐题得分无变化。"));
+  }
+  return box;
+}
+
+function releaseDetailPanel() {
+  const d = releaseState.detail;
+  const b = d.batch;
+  const card = h("div", { class: "card" },
+    h("h3", null, `第 ${b.batch_no} 批名单 · ${b.created_at}`),
+    h("p", { class: "small muted" },
+      `共 ${b.sheet_count} 张答题卡，按卷别、考生编号排序；本批为发布时刻的快照，` +
+      "之后的登记、勘误或题库修改都不会改变本批。"));
+  card.appendChild(d.diff
+    ? releaseDiffBox(d.diff)
+    : h("p", { class: "small muted" }, "本版首个发布批次，无上一批可对照。"));
+  const rows = d.sheets.map(sh => h("tr", null,
+    h("td", null, sh.paper + " 卷"),
+    h("td", null, sh.examinee),
+    h("td", null, String(sh.total_score)),
+    h("td", { class: "no-print" }, h("button", {
+      class: "mini ghost",
+      onclick: () => { releaseState.sheet = sh; renderSealDetailBody(); }
+    }, "逐题得分"))));
+  card.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null,
+      h("th", null, "卷别"), h("th", null, "考生编号"),
+      h("th", null, "总分"), h("th", { class: "no-print" }, "操作"))),
+    h("tbody", null, ...rows)));
+  return card;
+}
+
+function releaseSheetPanel() {
+  const sh = releaseState.sheet;
+  const card = h("div", { class: "card" },
+    h("h3", null, `逐题得分 · 考生 ${sh.examinee} · ${sh.paper} 卷 · 总分 ${sh.total_score}`),
+    h("p", { class: "small muted" }, "按该卷印出题号排列。"));
+  const rows = sh.items.map(it => h("tr", null,
+    h("td", null, String(it.number)),
+    h("td", null, String(it.score))));
+  card.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null, h("th", null, "题号"), h("th", null, "得分"))),
+    h("tbody", null, ...rows)));
+  card.appendChild(h("div", { class: "toolbar no-print" },
+    h("button", {
+      class: "ghost",
+      onclick: () => { releaseState.sheet = null; renderSealDetailBody(); }
+    }, "← 返回批次名单")));
+  return card;
+}
+
 function renderSealTabs() {
   const tabs = [
     ["paperA", "A 卷试卷"], ["cardA", "A 卷答题卡"], ["keyA", "A 卷答案表"],
     ["paperB", "B 卷试卷"], ["cardB", "B 卷答题卡"], ["keyB", "B 卷答案表"],
-    ["errata", "勘误"], ["sheets", "作答登记 / 复核"],
+    ["errata", "勘误"], ["sheets", "作答登记 / 复核"], ["releases", "成绩发布"],
   ];
   const bar = h("div", { class: "tabs no-print" });
   tabs.forEach(([key, label]) => {
@@ -769,6 +916,14 @@ function renderSealDetailBody() {
         content.appendChild(sheetListPanel());
       }
       break;
+    case "releases":
+      content.appendChild(releasePublishPanel());
+      content.appendChild(releaseListPanel());
+      if (releaseState.detail) {
+        content.appendChild(releaseDetailPanel());
+        if (releaseState.sheet) content.appendChild(releaseSheetPanel());
+      }
+      break;
   }
   host.appendChild(content);
 }
@@ -781,6 +936,9 @@ async function loadSeal(id, tab) {
     sealState.errata = (await api("GET", `/api/seals/${id}/errata`)).batches;
     sheetState.list = (await api("GET", `/api/seals/${id}/sheets`)).sheets;
     sheetState.detail = null;
+    releaseState.list = (await api("GET", `/api/seals/${id}/releases`)).batches;
+    releaseState.detail = null;
+    releaseState.sheet = null;
   } catch (e) { view.replaceChildren(h("p", { class: "pill err" }, e.message)); return; }
   if (tab) sealState.tab = tab;
   view.replaceChildren(

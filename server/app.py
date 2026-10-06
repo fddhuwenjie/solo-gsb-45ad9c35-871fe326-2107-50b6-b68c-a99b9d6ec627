@@ -801,6 +801,183 @@ def get_sheet(seal_id, sheet_id):
 
 
 # ---------------------------------------------------------------------------
+# score release batches
+# ---------------------------------------------------------------------------
+
+def _release_summary(db, batch_row):
+    d = dict(batch_row)
+    d["sheet_count"] = db.execute(
+        "SELECT COUNT(*) c FROM release_sheet WHERE batch_id = ?", (d["id"],)
+    ).fetchone()["c"]
+    return d
+
+
+@app.post("/api/seals/<int:seal_id>/releases")
+def create_release(seal_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+
+    # BEGIN IMMEDIATE takes the write lock up front: the roster, the answer
+    # key and every per-question score are read and snapshotted inside one
+    # transaction, so a registration or erratum racing the publish lands
+    # either wholly in this batch or wholly in the next one — never an old
+    # roster graded by a newer key.
+    try:
+        db.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        raise ApiError(409, "另一个写入操作正在进行，请稍后重试")
+    try:
+        correct_of = {
+            r["id"]: r["correct_sealed_option_id"]
+            for r in db.execute(
+                "SELECT id, correct_sealed_option_id FROM sealed_question WHERE seal_id = ?",
+                (seal_id,),
+            ).fetchall()
+        }
+        sheets = db.execute(
+            "SELECT id, paper, examinee FROM answer_sheet "
+            "WHERE seal_id = ? ORDER BY paper, examinee",
+            (seal_id,),
+        ).fetchall()
+        if not sheets:
+            db.rollback()
+            raise ApiError(400, "本封存版本尚未登记任何答题卡，拒绝发布成绩批次")
+
+        batch_no = db.execute(
+            "SELECT COALESCE(MAX(batch_no), 0) + 1 AS n FROM release_batch WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchone()["n"]
+        batch_id = db.execute(
+            "INSERT INTO release_batch (seal_id, batch_no) VALUES (?, ?)",
+            (seal_id, batch_no),
+        ).lastrowid
+
+        for sh in sheets:
+            rs_id = db.execute(
+                "INSERT INTO release_sheet (batch_id, paper, examinee, total_score) "
+                "VALUES (?, ?, ?, 0)",
+                (batch_id, sh["paper"], sh["examinee"]),
+            ).lastrowid
+            total = 0
+            for it in db.execute(
+                """SELECT i.sealed_option_id, pq.number, pq.sealed_question_id
+                     FROM answer_sheet_item i
+                     JOIN paper_question pq ON pq.id = i.paper_question_id
+                    WHERE i.sheet_id = ? ORDER BY pq.number""",
+                (sh["id"],),
+            ).fetchall():
+                score = 1 if (it["sealed_option_id"] is not None
+                              and it["sealed_option_id"] == correct_of[it["sealed_question_id"]]) else 0
+                total += score
+                db.execute(
+                    "INSERT INTO release_item (release_sheet_id, number, score) VALUES (?, ?, ?)",
+                    (rs_id, it["number"], score),
+                )
+            db.execute("UPDATE release_sheet SET total_score = ? WHERE id = ?", (total, rs_id))
+        db.commit()
+    except ApiError:
+        raise
+    except sqlite3.DatabaseError:
+        db.rollback()
+        raise ApiError(500, "发布写入失败，已回滚，未生成批次")
+    return jsonify({
+        "ok": True, "batch_id": batch_id, "batch_no": batch_no,
+        "sheet_count": len(sheets),
+    })
+
+
+@app.get("/api/seals/<int:seal_id>/releases")
+def list_releases(seal_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+    batches = [_release_summary(db, r) for r in db.execute(
+        "SELECT id, batch_no, created_at FROM release_batch "
+        "WHERE seal_id = ? ORDER BY batch_no DESC",
+        (seal_id,),
+    ).fetchall()]
+    return jsonify({"ok": True, "batches": batches})
+
+
+def _release_sheets(db, batch_id):
+    """Sheets of one batch: paper/examinee order, items in printed-number order."""
+    sheets = []
+    for sh in db.execute(
+        "SELECT id, paper, examinee, total_score FROM release_sheet "
+        "WHERE batch_id = ? ORDER BY paper, examinee",
+        (batch_id,),
+    ).fetchall():
+        d = dict(sh)
+        d["items"] = [dict(r) for r in db.execute(
+            "SELECT number, score FROM release_item "
+            "WHERE release_sheet_id = ? ORDER BY number",
+            (sh["id"],),
+        ).fetchall()]
+        sheets.append(d)
+    return sheets
+
+
+@app.get("/api/seals/<int:seal_id>/releases/<int:batch_id>")
+def get_release(seal_id, batch_id):
+    db = get_db()
+    batch = db.execute(
+        "SELECT id, batch_no, created_at FROM release_batch WHERE id = ? AND seal_id = ?",
+        (batch_id, seal_id),
+    ).fetchone()
+    if batch is None:
+        raise ApiError(404, "发布批次不存在")
+    sheets = _release_sheets(db, batch_id)
+
+    # Person-by-person comparison against the previous batch.  Both batches
+    # are immutable snapshots, so the diff is recomputed deterministically.
+    diff = None
+    prev = db.execute(
+        "SELECT id, batch_no FROM release_batch "
+        "WHERE seal_id = ? AND batch_no < ? ORDER BY batch_no DESC LIMIT 1",
+        (seal_id, batch["batch_no"]),
+    ).fetchone()
+    if prev is not None:
+        prev_by_examinee = {s["examinee"]: s for s in _release_sheets(db, prev["id"])}
+        new_examinees = []
+        changes = []
+        totals = []
+        for sh in sheets:
+            old = prev_by_examinee.get(sh["examinee"])
+            if old is None:
+                new_examinees.append({"examinee": sh["examinee"], "paper": sh["paper"]})
+                continue
+            old_scores = {it["number"]: it["score"] for it in old["items"]}
+            person_changes = [
+                {
+                    "examinee": sh["examinee"], "paper": sh["paper"],
+                    "number": it["number"],
+                    "before": old_scores.get(it["number"]), "after": it["score"],
+                }
+                for it in sh["items"]
+                if old_scores.get(it["number"]) != it["score"]
+            ]
+            if person_changes:
+                changes.extend(person_changes)
+                totals.append({
+                    "examinee": sh["examinee"], "paper": sh["paper"],
+                    "before": old["total_score"], "after": sh["total_score"],
+                })
+        diff = {
+            "previous_batch_no": prev["batch_no"],
+            "new_examinees": new_examinees,
+            "changes": changes,
+            "totals": totals,
+        }
+    return jsonify({
+        "ok": True,
+        "batch": _release_summary(db, batch),
+        "sheets": sheets,
+        "diff": diff,
+    })
+
+
+# ---------------------------------------------------------------------------
 # pages
 # ---------------------------------------------------------------------------
 
