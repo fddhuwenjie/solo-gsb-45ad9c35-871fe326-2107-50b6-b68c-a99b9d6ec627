@@ -801,6 +801,211 @@ def get_sheet(seal_id, sheet_id):
 
 
 # ---------------------------------------------------------------------------
+# score release batches (frozen, reviewable)
+# ---------------------------------------------------------------------------
+
+def _score_batches(db, seal_id):
+    return [dict(r) for r in db.execute(
+        "SELECT id, seq, sheet_count, created_at FROM score_batch "
+        "WHERE seal_id = ? ORDER BY seq",
+        (seal_id,),
+    ).fetchall()]
+
+
+def _score_batch_rows(db, seal_id, batch_id):
+    """Frozen sheets + per-question items of one batch, ordered paper/examinee.
+
+    Items of each sheet are ordered by the question number printed on the
+    paper the examinee actually answered.
+    """
+    batch = db.execute(
+        "SELECT id, seal_id, seq, sheet_count, created_at FROM score_batch "
+        "WHERE id = ? AND seal_id = ?",
+        (batch_id, seal_id),
+    ).fetchone()
+    if batch is None:
+        return None, None
+    entries = []
+    for bs in db.execute(
+        """SELECT id, answer_sheet_id, paper, examinee, total_score
+             FROM score_batch_sheet WHERE batch_id = ?
+            ORDER BY paper, examinee""",
+        (batch_id,),
+    ).fetchall():
+        items = [dict(r) for r in db.execute(
+            "SELECT number, letter, score FROM score_batch_item "
+            "WHERE batch_sheet_id = ? ORDER BY number",
+            (bs["id"],),
+        ).fetchall()]
+        d = dict(bs)
+        d["items"] = items
+        entries.append(d)
+    return dict(batch), entries
+
+
+def _batch_comparison(prev_entries, entries):
+    """Compare a batch against the previous one, person by person.
+
+    Persons are keyed by the same answer_sheet_id; per-question changes keyed
+    by printed number.  Item changes are reported even when the totals cancel.
+    Returns {"new":[ids], "total_changed":[ids], "item_changes": {id:[...]},
+    "prev_totals": {id: score}}.
+    """
+    prev_by_sheet = {e["answer_sheet_id"]: e for e in (prev_entries or [])}
+    item_changes = {}
+    new_ids = []
+    total_changed = []
+    prev_totals = {}
+    for e in entries:
+        sid = e["answer_sheet_id"]
+        old = prev_by_sheet.get(sid)
+        if old is None:
+            new_ids.append(sid)
+            continue
+        prev_totals[sid] = old["total_score"]
+        if old["total_score"] != e["total_score"]:
+            total_changed.append(sid)
+        old_by_num = {i["number"]: i["score"] for i in old["items"]}
+        diffs = []
+        for i in e["items"]:
+            before = old_by_num.get(i["number"])
+            if before is not None and before != i["score"]:
+                diffs.append({"number": i["number"], "before": before, "after": i["score"]})
+        if diffs:
+            item_changes[sid] = diffs
+    return {"new": new_ids, "total_changed": total_changed,
+            "item_changes": item_changes, "prev_totals": prev_totals}
+
+
+def _score_batch_payload(db, seal_id, batch_id):
+    """Batch detail plus the person-by-person comparison with the prior batch."""
+    batch, entries = _score_batch_rows(db, seal_id, batch_id)
+    if batch is None:
+        return None
+    payload = {"batch": batch, "entries": entries}
+    prev = db.execute(
+        "SELECT id FROM score_batch WHERE seal_id = ? AND seq < ? ORDER BY seq DESC LIMIT 1",
+        (seal_id, batch["seq"]),
+    ).fetchone()
+    if prev is None:
+        payload["comparison"] = None
+    else:
+        _, prev_entries = _score_batch_rows(db, seal_id, prev["id"])
+        payload["comparison"] = _batch_comparison(prev_entries, entries)
+    return payload
+
+
+@app.post("/api/seals/<int:seal_id>/score-batches")
+def publish_score_batch(seal_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+
+    # BEGIN IMMEDIATE takes the write lock before any read: concurrent
+    # registrations / errata block until we commit or roll back, so the roster
+    # and the scores written below are guaranteed to be one database state.
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        sheets = [dict(r) for r in db.execute(
+            "SELECT id, paper, examinee FROM answer_sheet WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchall()]
+        if not sheets:
+            db.rollback()
+            raise ApiError(400, "当前封存版本还没有登记任何答题卡，拒绝发布")
+
+        # Grading key at this instant (sealed answers after all applied errata).
+        correct_of = {
+            r["id"]: r["correct_sealed_option_id"]
+            for r in db.execute(
+                "SELECT id, correct_sealed_option_id FROM sealed_question WHERE seal_id = ?",
+                (seal_id,),
+            ).fetchall()
+        }
+        rows_by_sheet = {}
+        for r in db.execute(
+            """SELECT i.sheet_id, i.sealed_option_id, pq.id AS pq_id,
+                      pq.number, pq.sealed_question_id, i.letter
+                 FROM answer_sheet_item i
+                 JOIN paper_question pq ON pq.id = i.paper_question_id
+                WHERE i.sheet_id IN (SELECT id FROM answer_sheet WHERE seal_id = ?)""",
+            (seal_id,),
+        ).fetchall():
+            rows_by_sheet.setdefault(r["sheet_id"], []).append(r)
+
+        seq = db.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS v FROM score_batch WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchone()["v"]
+        batch_id = db.execute(
+            "INSERT INTO score_batch (seal_id, seq, sheet_count) VALUES (?, ?, ?)",
+            (seal_id, seq, len(sheets)),
+        ).lastrowid
+        for sh in sheets:
+            total = 0
+            frozen_items = []
+            for r in rows_by_sheet.get(sh["id"], []):
+                score = 1 if (
+                    r["sealed_option_id"] is not None
+                    and r["sealed_option_id"] == correct_of[r["sealed_question_id"]]
+                ) else 0
+                total += score
+                frozen_items.append((r["pq_id"], r["number"], r["letter"], score))
+            frozen_items.sort(key=lambda x: x[1])  # printed question number order
+            bs_id = db.execute(
+                """INSERT INTO score_batch_sheet
+                   (batch_id, answer_sheet_id, paper, examinee, total_score)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (batch_id, sh["id"], sh["paper"], sh["examinee"], total),
+            ).lastrowid
+            for pq_id, number, letter, score in frozen_items:
+                db.execute(
+                    """INSERT INTO score_batch_item
+                       (batch_sheet_id, paper_question_id, number, letter, score)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (bs_id, pq_id, number, letter, score),
+                )
+        db.commit()
+    except ApiError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        db.rollback()
+        raise ApiError(500, f"成绩发布失败，已回滚，未生成批次：{exc}")
+
+    payload = _score_batch_payload(db, seal_id, batch_id)
+    return jsonify({"ok": True, "result": payload})
+
+
+@app.get("/api/seals/<int:seal_id>/score-batches")
+def list_score_batches(seal_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+    batches = _score_batches(db, seal_id)
+    # attach the "compared with previous batch" summary of each batch
+    entries_by_batch = {}
+    for b in batches:
+        _, entries = _score_batch_rows(db, seal_id, b["id"])
+        entries_by_batch[b["id"]] = entries
+    for idx, b in enumerate(batches):
+        if idx == 0:
+            b["comparison"] = None
+        else:
+            b["comparison"] = _batch_comparison(entries_by_batch[batches[idx - 1]["id"]],
+                                                entries_by_batch[b["id"]])
+    return jsonify({"ok": True, "batches": batches})
+
+
+@app.get("/api/seals/<int:seal_id>/score-batches/<int:batch_id>")
+def get_score_batch(seal_id, batch_id):
+    db = get_db()
+    payload = _score_batch_payload(db, seal_id, batch_id)
+    if payload is None:
+        raise ApiError(404, "成绩批次不存在")
+    return jsonify({"ok": True, "result": payload})
+
+
+# ---------------------------------------------------------------------------
 # pages
 # ---------------------------------------------------------------------------
 

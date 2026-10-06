@@ -142,6 +142,19 @@ table.data th { background: #f6f8fb; }
 .sheet-grid .sheet-cell label { margin: 0; }
 table.data tr.changed td { background: #fdf6e3; }
 
+/* frozen score-release batches */
+.score-scroll { overflow-x: auto; }
+table.score-matrix { text-align: center; }
+table.score-matrix th, table.score-matrix td { text-align: center; white-space: nowrap; }
+table.score-matrix tr.newrow td { background: #eef8f2; }
+.scell { min-width: 44px; }
+.scell .sletter { display: block; font-size: 12px; color: var(--muted); line-height: 1.2; }
+.scell .sscore { font-size: 14px; }
+.scell .s1 { color: var(--ok); }
+.scell .s0 { color: var(--muted); }
+.scell.changed { background: #fdf0c8 !important; outline: 1px solid #ecd9a8; }
+.total-diff { color: var(--warn); }
+
 @media print {
   body { background: #fff; }
   .topbar, .toolbar, .tabs, .no-print, #toast { display: none !important; }

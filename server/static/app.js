@@ -61,7 +61,7 @@ function renderHome() {
   setActiveNav("home");
   view.replaceChildren(
     h("h1", null, "本地双卷印发校核"),
-    h("p", { class: "muted" }, "单选题库 → 分别编排 A、B 卷 → 同一题库修订封存 → 打印试卷 / 答题卡 / 答案表 → 勘误并同步两卷答案 → 登记答题卡并按勘误复核成绩。"),
+    h("p", { class: "muted" }, "单选题库 → 分别编排 A、B 卷 → 同一题库修订封存 → 打印试卷 / 答题卡 / 答案表 → 勘误并同步两卷答案 → 登记答题卡并按勘误复核成绩 → 发布可回看的成绩批次。"),
     h("div", { class: "grid2" },
       h("div", { class: "card" },
         h("h3", null, "① 维护题库"),
@@ -87,7 +87,11 @@ function renderHome() {
         h("h3", null, "⑤ 登记答题卡与复核"),
         h("p", { class: "small muted" }, "按封存卷印出的题号登记考生作答（每题 1 分、空白 0 分）；勘误后按原作答的封存选项重新核分，对照登记成绩与当前成绩。"),
         h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
-      )
+      ),
+      h("div", { class: "card" },
+        h("h3", null, "⑥ 发布成绩批次"),
+        h("p", { class: "small muted" }, "发布封存版本当前已登记的全部答题卡：按卷别、考生编号排序保存总分与逐题得分，批次立即冻结；再次发布与上批逐人对照，可回看每批明细。"),
+        h("a", { class: "btn", href: "#/seals" }, "去发布成绩"))
     )
   );
 }
@@ -376,6 +380,7 @@ async function renderSeals() {
 
 const sealState = { detail: null, errata: [], tab: "paperA" };
 const sheetState = { list: [], detail: null, paper: "A" };
+const scoreState = { batches: [], detail: null };
 
 function sheetHeader(subtitle) {
   const s = sealState.detail;
@@ -722,11 +727,207 @@ function sheetDetailPanel() {
   return card;
 }
 
+/* ------------------------------------------------------- score release */
+
+async function openBatch(batchId) {
+  try {
+    scoreState.detail = (await api(
+      "GET", `/api/seals/${sealState.detail.id}/score-batches/${batchId}`)).result;
+    renderSealDetailBody();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function scorePublishPanel() {
+  const count = sheetState.list.length;
+  const busy = h("span", { class: "muted small" });
+  const btn = h("button", {
+    onclick: async () => {
+      if (!confirm(
+        "按当前已登记的全部答题卡发布本版本的一个成绩批次？\n\n" +
+        "发布时名单与逐题得分取自同一数据库状态；发布后的批次将被冻结，" +
+        "之后的登记、勘误或题库修改都不会改变它。")) return;
+      btn.disabled = true;
+      busy.textContent = "发布中…";
+      try {
+        const r = await api("POST",
+          `/api/seals/${sealState.detail.id}/score-batches`, {});
+        toast(`已发布第 ${r.result.batch.seq} 批成绩（${r.result.batch.sheet_count} 人）`, "ok");
+        scoreState.detail = r.result;
+        scoreState.batches = (await api(
+          "GET", `/api/seals/${sealState.detail.id}/score-batches`)).batches;
+        sealState.tab = "scores";
+        renderSealDetailBody();
+      } catch (e) {
+        btn.disabled = false;
+        busy.textContent = "";
+        toast(e.message, "err");
+      }
+    }
+  }, "发布当前全部答题卡成绩");
+  if (!count) btn.disabled = true;
+
+  return h("div", { class: "card screen-only" },
+    h("h3", null, "发布成绩批次"),
+    h("p", { class: "small muted" },
+      "一次性发布本封存版本当前已登记的全部答题卡：按卷别、考生编号排序列出总分，" +
+      "并保存每张卡按印出题号排列的逐题得分。名单与得分取自同一个数据库状态，" +
+      "登记 / 勘误与发布交错时，各项变化只会整体归入本批或留到下批。已发布批次冻结，" +
+      "不随之后的登记、勘误或题库修改改变。"),
+    h("div", { class: "toolbar" },
+      btn,
+      h("span", null, count
+        ? h("span", { class: "pill ok" }, `当前已登记 ${count} 张答题卡`)
+        : h("span", { class: "pill err" }, "尚无答题卡：无法发布，请先登记")),
+      busy));
+}
+
+function batchSummaryLine(b, cmp) {
+  if (!cmp) return h("span", { class: "pill" }, "首批发布");
+  const parts = [];
+  if (cmp.new.length) parts.push(`${cmp.new.length} 名新登记`);
+  if (cmp.total_changed.length) parts.push(`${cmp.total_changed.length} 人总分变化`);
+  const itemN = Object.values(cmp.item_changes).reduce((n, arr) => n + arr.length, 0);
+  if (itemN) parts.push(`${itemN} 道题得分变化`);
+  return parts.length
+    ? h("span", { class: "pill warn" }, parts.join("，"))
+    : h("span", { class: "pill ok" }, "与上批成绩一致");
+}
+
+function scoreHistoryPanel() {
+  const card = h("div", { class: "card screen-only" }, h("h3", null, "已发布批次"));
+  if (!scoreState.batches.length) {
+    card.appendChild(h("p", { class: "muted small" }, "尚未发布过成绩批次。"));
+    return card;
+  }
+  const rows = [...scoreState.batches].reverse().map(b => h("tr", null,
+    h("td", null, "第 " + b.seq + " 批"),
+    h("td", null, b.created_at),
+    h("td", null, String(b.sheet_count)),
+    h("td", null, batchSummaryLine(b, b.comparison)),
+    h("td", null, h("button", { class: "mini ghost", onclick: () => openBatch(b.id) }, "回看明细"))));
+  card.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null,
+      h("th", null, "批次"), h("th", null, "发布时间"), h("th", null, "人数"),
+      h("th", null, "与上批对照"), h("th", null, "操作"))),
+    h("tbody", null, ...rows)));
+  card.appendChild(h("p", { class: "small muted" },
+    "再次发布后可在此逐人对照：新登记者、总分变化者都会标出；总分相抵时仍会列出逐题变化。"));
+  return card;
+}
+
+function scoreMatrixCard(paper, entries, cmp) {
+  const list = entries.filter(e => e.paper === paper);
+  if (!list.length) return null;
+  const numbers = list[0].items.map(i => i.number);
+  const changedMap = new Map(Object.entries(cmp ? cmp.item_changes : {}));
+  const newSet = new Set(cmp ? cmp.new : []);
+  const totalChangedSet = new Set(cmp ? cmp.total_changed : []);
+
+  const head = h("tr", null,
+    h("th", null, "考生编号"), h("th", null, "总分"), h("th", null, "上批"),
+    ...numbers.map(n => h("th", null, String(n))));
+  const bodyRows = list.map(e => {
+    const isNew = newSet.has(e.answer_sheet_id);
+    const totalDiff = totalChangedSet.has(e.answer_sheet_id);
+    const diffs = changedMap.get(String(e.answer_sheet_id)) || [];
+    const diffNums = new Map(diffs.map(d => [d.number, d]));
+    const prevTotal = cmp
+      ? (isNew ? null : (cmp.prev_totals?.[e.answer_sheet_id]
+          ?? cmp.prev_totals?.[String(e.answer_sheet_id)]))
+      : undefined;
+
+    const cells = e.items.map(it => {
+      const d = diffNums.get(it.number);
+      const title = d
+        ? `第 ${it.number} 题：${d.before} → ${d.after}`
+        : `第 ${it.number} 题：${it.letter || "空白"}，得 ${it.score} 分`;
+      return h("td", { class: "scell" + (d ? " changed" : ""), title },
+        h("span", { class: "sletter" }, it.letter || "·"),
+        h("b", { class: "sscore s" + it.score }, String(it.score)));
+    });
+    return h("tr", { class: isNew ? "newrow" : "" },
+      h("td", null, e.examinee,
+        isNew ? h("span", { class: "pill ok", style: "margin-left:6px" }, "新登记") : null),
+      h("td", null, h("b", { class: totalDiff ? "total-diff" : "" }, String(e.total_score))),
+      h("td", { class: "muted" },
+        cmp ? (prevTotal === null || prevTotal === undefined ? "—" : String(prevTotal)) : "—"),
+      ...cells);
+  });
+  return h("div", { class: "card" },
+    h("h3", null, `${paper} 卷成绩明细（${list.length} 人）`),
+    h("div", { class: "score-scroll" },
+      h("table", { class: "data score-matrix" }, h("thead", null, head), h("tbody", null, ...bodyRows))));
+}
+
+function scoreBatchDetailPanel() {
+  const r = scoreState.detail;
+  const b = r.batch;
+  const cmp = r.comparison;
+  const wrap = h("div");
+
+  wrap.appendChild(h("div", { class: "card screen-only" },
+    h("h3", null, `第 ${b.seq} 批成绩 · 发布于 ${b.created_at}`),
+    h("p", { class: "small muted" },
+      `共 ${b.sheet_count} 人；本批名单与逐题得分发布时即冻结，不随之后的登记、勘误或题库修改改变。`)));
+
+  if (!cmp) {
+    wrap.appendChild(h("div", { class: "card screen-only" },
+      h("p", null, h("span", { class: "pill" }, "首批发布"), "　无上一批可对照。")));
+  } else {
+    const itemN = Object.values(cmp.item_changes).reduce((n, arr) => n + arr.length, 0);
+    const newEntries = r.entries.filter(e => cmp.new.includes(e.answer_sheet_id));
+    const changedEntries = r.entries.filter(e => cmp.total_changed.includes(e.answer_sheet_id));
+    const itemOnly = r.entries.filter(e =>
+      !cmp.total_changed.includes(e.answer_sheet_id)
+      && !cmp.new.includes(e.answer_sheet_id)
+      && cmp.item_changes[e.answer_sheet_id]);
+
+    wrap.appendChild(h("div", { class: "card screen-only" },
+      h("h3", null, "与上一批逐人对照"),
+      h("p", null,
+        "新登记 ", h("span", { class: "pill ok" }, String(cmp.new.length)),
+        "　总分变化 ", h("span", { class: "pill warn" }, String(cmp.total_changed.length)),
+        "　逐题变化合计 ", h("span", { class: "pill warn" }, String(itemN)),
+        h("span", { class: "small muted" }, "　（总分相抵的逐题变化也计入并在下方矩阵标出）")),
+      newEntries.length ? h("p", { class: "small" },
+        "新登记者：", ...newEntries.map((e, i) =>
+          h("span", { class: "ocode" }, (i ? "，" : "") + `${e.paper}卷 ${e.examinee}`))) : null,
+      changedEntries.length ? h("p", { class: "small" },
+        "总分变化：", ...changedEntries.map((e, i) => {
+          const prev = cmp.prev_totals[e.answer_sheet_id];
+          return h("span", { class: "ocode" },
+            (i ? "，" : "") + `${e.examinee} ${prev}→${e.total_score}`);
+        })) : null,
+      itemOnly.length ? h("div", { class: "note-box" },
+        "总分相抵但逐题有变化：" + itemOnly.map(e =>
+          `${e.examinee}（第 ${cmp.item_changes[e.answer_sheet_id].map(d => d.number).join("、")} 题）`
+        ).join("；")) : null));
+  }
+
+  wrap.appendChild(scoreMatrixCard("A", r.entries, cmp));
+  const cardB = scoreMatrixCard("B", r.entries, cmp);
+  if (cardB) wrap.appendChild(cardB);
+
+  wrap.appendChild(h("p", { class: "small muted screen-only" },
+    "矩阵按卷别、考生编号排序；每格上排为该生作答字母（· 为空白），下排为本批得分；" +
+    "黄底表示与上一批相比该题得分前后不同，悬停可见前后分数。"));
+  wrap.appendChild(h("div", { class: "toolbar no-print" },
+    h("button", { class: "ghost", onclick: () => { scoreState.detail = null; renderSealDetailBody(); } },
+      "← 返回批次列表")));
+  return wrap;
+}
+
+function scorePanel() {
+  if (scoreState.detail) return scoreBatchDetailPanel();
+  return h("div", null, scorePublishPanel(), scoreHistoryPanel());
+}
+
 function renderSealTabs() {
   const tabs = [
     ["paperA", "A 卷试卷"], ["cardA", "A 卷答题卡"], ["keyA", "A 卷答案表"],
     ["paperB", "B 卷试卷"], ["cardB", "B 卷答题卡"], ["keyB", "B 卷答案表"],
     ["errata", "勘误"], ["sheets", "作答登记 / 复核"],
+    ["scores", "成绩发布 / 回看"],
   ];
   const bar = h("div", { class: "tabs no-print" });
   tabs.forEach(([key, label]) => {
@@ -769,6 +970,7 @@ function renderSealDetailBody() {
         content.appendChild(sheetListPanel());
       }
       break;
+    case "scores": content.appendChild(scorePanel()); break;
   }
   host.appendChild(content);
 }
@@ -781,6 +983,8 @@ async function loadSeal(id, tab) {
     sealState.errata = (await api("GET", `/api/seals/${id}/errata`)).batches;
     sheetState.list = (await api("GET", `/api/seals/${id}/sheets`)).sheets;
     sheetState.detail = null;
+    scoreState.batches = (await api("GET", `/api/seals/${id}/score-batches`)).batches;
+    scoreState.detail = null;
   } catch (e) { view.replaceChildren(h("p", { class: "pill err" }, e.message)); return; }
   if (tab) sealState.tab = tab;
   view.replaceChildren(

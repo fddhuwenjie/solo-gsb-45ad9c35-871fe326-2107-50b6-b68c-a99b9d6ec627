@@ -140,6 +140,38 @@ CREATE TABLE IF NOT EXISTS erratum_item (
     paper_b_old_letter       TEXT,
     paper_b_new_letter       TEXT
 );
+
+-- Frozen score-release batches.  A publish snapshots, inside one write
+-- transaction, the complete roster of currently registered sheets AND every
+-- per-question score graded against the key at that instant (errata
+-- included).  Later registrations, errata or bank edits never touch these
+-- rows, so every released batch stays reviewable exactly as released.
+CREATE TABLE IF NOT EXISTS score_batch (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id     INTEGER NOT NULL REFERENCES seal(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    sheet_count INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(seal_id, seq)
+);
+CREATE TABLE IF NOT EXISTS score_batch_sheet (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES score_batch(id) ON DELETE CASCADE,
+    answer_sheet_id INTEGER NOT NULL REFERENCES answer_sheet(id) ON DELETE CASCADE,
+    paper           TEXT NOT NULL CHECK(paper IN ('A', 'B')),
+    examinee        TEXT NOT NULL,
+    total_score     INTEGER NOT NULL,
+    UNIQUE(batch_id, answer_sheet_id)
+);
+CREATE TABLE IF NOT EXISTS score_batch_item (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_sheet_id     INTEGER NOT NULL REFERENCES score_batch_sheet(id) ON DELETE CASCADE,
+    paper_question_id  INTEGER NOT NULL REFERENCES paper_question(id) ON DELETE CASCADE,
+    number             INTEGER NOT NULL,      -- printed question number at release
+    letter             TEXT CHECK(letter IN ('A','B','C','D')),  -- NULL = 空白
+    score              INTEGER NOT NULL CHECK(score IN (0, 1)),
+    UNIQUE(batch_sheet_id, paper_question_id)
+);
 """
 
 
@@ -150,6 +182,7 @@ def get_db():
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 8000")
         g.db = conn
     return g.db
 
